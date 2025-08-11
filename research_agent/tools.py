@@ -31,13 +31,7 @@ async def add_to_knowledge_base(
 ) -> None:
     """
     Adds content to the ChromaDB knowledge base after chunking.
-
-    Args:
-        content: The text content to add.
-        metadata: A dictionary of metadata to associate with the content.
-        chroma_collection: The ChromaDB collection instance.
     """
-    # Simple chunking strategy by double newline
     chunks = content.split('\n\n')
     ids = [hashlib.sha256(chunk.encode()).hexdigest() for chunk in chunks]
     
@@ -45,7 +39,7 @@ async def add_to_knowledge_base(
         chroma_collection.upsert(
             ids=ids,
             documents=chunks,
-            metadatas=[metadata] * len(chunks) # Apply same metadata to all chunks
+            metadatas=[metadata] * len(chunks)
         )
     except Exception as e:
         raise ToolExecutionError(f"Failed to add to knowledge base: {e}")
@@ -53,6 +47,7 @@ async def add_to_knowledge_base(
 # --- Research Tools ---
 
 async def query_arxiv(
+    conversation_id: str,
     query: str,
     max_results: int,
     db_session: AsyncSession,
@@ -67,7 +62,6 @@ async def query_arxiv(
             max_results=max_results,
             sort_by=arxiv.SortCriterion.SubmittedDate
         )
-        # Wrap synchronous call in to_thread
         results = await asyncio.to_thread(lambda: list(search.results()))
 
         if not results:
@@ -86,8 +80,8 @@ async def query_arxiv(
         
         result_str = json.dumps(papers, indent=2)
         
-        # Log to DB and Knowledge Base
         history_entry = ToolCallHistory(
+            conversation_id=conversation_id,
             tool_name="query_arxiv",
             parameters=json.dumps({"query": query, "max_results": max_results}),
             result=result_str,
@@ -95,7 +89,6 @@ async def query_arxiv(
         db_session.add(history_entry)
         await db_session.commit()
 
-        # Add summaries to knowledge base
         for paper in papers:
             await add_to_knowledge_base(
                 content=f"Title: {paper['title']}\nSummary: {paper['summary']}",
@@ -104,12 +97,14 @@ async def query_arxiv(
             )
 
         return result_str
-
+    except NoResultsFoundError:
+        raise # Re-raise the specific error to be handled by the caller
     except Exception as e:
         raise APICallError(f"Failed to query ArXiv: {e}")
 
 
 async def search_github_code(
+    conversation_id: str,
     query: str,
     db_session: AsyncSession,
     chroma_collection: Collection,
@@ -120,12 +115,10 @@ async def search_github_code(
     try:
         g = Github(settings.GITHUB_TOKEN)
         
-        # Proactive rate limit check
         rate_limit = g.get_rate_limit()
         if rate_limit.core.remaining < 10:
              raise RateLimitError("GitHub API rate limit is low. Please try again later.")
 
-        # Wrap synchronous call in to_thread
         results = await asyncio.to_thread(g.search_code, query)
         
         if results.totalCount == 0:
@@ -138,12 +131,13 @@ async def search_github_code(
                 "url": item.html_url,
                 "score": item.score,
             }
-            for item in results[:10] # Limit to top 10 results
+            for item in results[:10]
         ]
         
         result_str = json.dumps(code_files, indent=2)
 
         history_entry = ToolCallHistory(
+            conversation_id=conversation_id,
             tool_name="search_github_code",
             parameters=json.dumps({"query": query}),
             result=result_str,
@@ -151,11 +145,14 @@ async def search_github_code(
         db_session.add(history_entry)
         await db_session.commit()
 
-        # Add to knowledge base (optional, could be noisy)
-        # For now, we'll just log the call, not the code snippets.
+        for item in code_files:
+            await add_to_knowledge_base(
+                content=f"Found relevant code in repository: {item['repository']}, file: {item['file_path']}",
+                metadata={"source": "github", "query": query, "url": item['url']},
+                chroma_collection=chroma_collection,
+            )
 
         return result_str
-
     except GithubRateLimitExceededException:
         raise RateLimitError("GitHub API rate limit exceeded.")
     except Exception as e:
@@ -163,6 +160,7 @@ async def search_github_code(
 
 
 async def extract_web_content(
+    conversation_id: str,
     url: str,
     db_session: AsyncSession,
     chroma_collection: Collection,
@@ -177,22 +175,22 @@ async def extract_web_content(
 
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Heuristic to find main content
         content_tags = ["article", "main", "div.post-content", "div.content", "body"]
         text = ""
         for tag in content_tags:
             element = soup.select_one(tag)
             if element:
                 text = element.get_text(separator="\n", strip=True)
-                if len(text.split()) > 50: # Check for substantial content
+                if len(text.split()) > 50:
                     break
         
         if not text:
             raise ContentExtractionError("Could not extract meaningful content from the URL.")
 
-        result_str = json.dumps({"url": url, "content": text[:4000]}, indent=2) # Truncate for logging
+        result_str = json.dumps({"url": url, "content": text[:4000]}, indent=2)
 
         history_entry = ToolCallHistory(
+            conversation_id=conversation_id,
             tool_name="extract_web_content",
             parameters=json.dumps({"url": url}),
             result=result_str,
@@ -207,7 +205,6 @@ async def extract_web_content(
         )
 
         return json.dumps({"url": url, "content": text}, indent=2)
-
     except httpx.HTTPStatusError as e:
         raise APICallError(f"HTTP error fetching URL {url}: {e.response.status_code}")
     except Exception as e:
@@ -215,6 +212,7 @@ async def extract_web_content(
 
 
 async def search_local_codebase(
+    conversation_id: str,
     query: str,
     db_session: AsyncSession,
     chroma_collection: Collection,
@@ -224,20 +222,19 @@ async def search_local_codebase(
     """
     base_path = settings.LOCAL_CODEBASE_PATH
     
-    # Security: Sanitize the user input to prevent shell injection
     safe_query = shlex.quote(query)
-    command = f"rg --json --case-sensitive {safe_query} ."
+    command = ['rg', '--json', '--case-sensitive', safe_query, '.']
 
     try:
         process = await asyncio.create_subprocess_exec(
-            *command.split(),
+            *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=base_path
         )
         stdout, stderr = await process.communicate()
 
-        if process.returncode != 0 and process.returncode != 1: # rg exits 1 if no results
+        if process.returncode != 0 and process.returncode != 1:
             raise FileOperationError(f"ripgrep failed: {stderr.decode()}")
         
         results = []
@@ -246,7 +243,7 @@ async def search_local_codebase(
                 try:
                     results.append(json.loads(line))
                 except json.JSONDecodeError:
-                    continue # Ignore non-json lines
+                    continue
 
         if not results and process.returncode == 1:
             raise NoResultsFoundError("No results found in the local codebase.")
@@ -254,6 +251,7 @@ async def search_local_codebase(
         result_str = json.dumps(results, indent=2)
 
         history_entry = ToolCallHistory(
+            conversation_id=conversation_id,
             tool_name="search_local_codebase",
             parameters=json.dumps({"query": query}),
             result=result_str,
@@ -261,24 +259,18 @@ async def search_local_codebase(
         db_session.add(history_entry)
         await db_session.commit()
 
-        # Add file contents to knowledge base
         for res in results:
             if res.get('type') == 'match':
-                file_path = f"{base_path}/{res['data']['path']['text']}"
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                    await add_to_knowledge_base(
-                        content=file_content,
-                        metadata={"source": "local_codebase", "file_path": file_path},
-                        chroma_collection=chroma_collection,
-                    )
-                except Exception:
-                    # Ignore if file can't be read
-                    pass
+                file_path = res['data']['path']['text']
+                line_number = res['data']['line_number']
+                line_text = res['data']['lines']['text'].strip()
+                await add_to_knowledge_base(
+                    content=line_text,
+                    metadata={"source": "local_codebase", "file_path": file_path, "line_number": line_number},
+                    chroma_collection=chroma_collection,
+                )
 
         return result_str
-
     except FileNotFoundError:
         raise ToolExecutionError("ripgrep (rg) is not installed or not in PATH.")
     except Exception as e:
@@ -290,7 +282,7 @@ async def search_internal_knowledge_base(
     n_results: int = 5,
     where_filter: Dict[str, Any] = None,
     chroma_collection: Collection = None,
-    **kwargs # To absorb db_session if passed
+    **kwargs
 ) -> str:
     """
     Searches the agent's internal vector knowledge base.
@@ -313,30 +305,30 @@ async def search_internal_knowledge_base(
 AVAILABLE_TOOLS_SCHEMA = [
     {
         "name": "query_arxiv",
-        "description": "Search for scientific papers on ArXiv to find cutting-edge research, algorithms, and theoretical foundations.",
+        "description": "Search ArXiv for scientific papers. Use for finding cutting-edge research, algorithms, and theoretical foundations. Best for academic and scientific topics.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "The search query (e.g., 'quantum computing', 'author:Yann LeCun')."},
-                "max_results": {"type": "integer", "description": "The maximum number of papers to return.", "default": 5},
+                "max_results": {"type": "integer", "description": "Maximum number of papers to return.", "default": 5},
             },
             "required": ["query"],
         },
     },
     {
         "name": "search_github_code",
-        "description": "Search for code examples, libraries, and implementations on GitHub.",
+        "description": "Search GitHub for code. Essential for finding real-world implementations, libraries, and code examples. Use qualifiers like 'language:python' or 'repo:owner/repo' for targeted searches.",
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "The search query, including qualifiers like 'language:python' or 'repo:owner/repo'."},
+                "query": {"type": "string", "description": "The search query. Can include GitHub search qualifiers."},
             },
             "required": ["query"],
         },
     },
     {
         "name": "extract_web_content",
-        "description": "Extract the main textual content from a URL. Useful for reading documentation, articles, or blog posts.",
+        "description": "Extract the main text from a URL. Ideal for reading documentation, articles, and blog posts to understand a topic or technology.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -347,24 +339,24 @@ AVAILABLE_TOOLS_SCHEMA = [
     },
     {
         "name": "search_local_codebase",
-        "description": "Search the contents of files in the current project directory using a regular expression.",
+        "description": "Search the contents of files in the current project directory using a regular expression via ripgrep (rg). Crucial for understanding the existing code before making changes.",
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "The ripgrep-compatible regex pattern to search for."},
+                "query": {"type": "string", "description": "A ripgrep-compatible regex pattern to search for within the local project files."},
             },
             "required": ["query"],
         },
     },
     {
         "name": "search_internal_knowledge_base",
-        "description": "Search the agent's long-term memory for relevant information, notes, and past findings.",
+        "description": "Search your own long-term memory for relevant information from past interactions and research. This should be your first step when starting a new task to see what you already know.",
         "parameters": {
             "type": "object",
             "properties": {
-                "query_texts": {"type": "array", "items": {"type": "string"}, "description": "A list of texts to search for."},
-                "n_results": {"type": "integer", "description": "The number of results to return.", "default": 5},
-                "where_filter": {"type": "object", "description": "A metadata filter to apply (e.g., {'source': 'arxiv'})."},
+                "query_texts": {"type": "array", "items": {"type": "string"}, "description": "A list of questions or topics to search for in your memory."}, 
+                "n_results": {"type": "integer", "description": "Number of results to return.", "default": 5},
+                "where_filter": {"type": "object", "description": "Optional metadata filter (e.g., {'source': 'arxiv'})."},
             },
             "required": ["query_texts"],
         },
