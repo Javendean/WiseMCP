@@ -9,6 +9,7 @@ from sqlmodel import SQLModel, Column, JSON
 class ToolParameterProperty(BaseModel):
     type: str
     description: str
+    default: Optional[Any] = None
 
 class ToolParameters(BaseModel):
     type: str = "object"
@@ -21,10 +22,12 @@ class Tool(BaseModel):
     parameters: ToolParameters
 
 class ToolExecutionRequest(BaseModel):
-    name: str
+    tool_name: str
     parameters: Dict[str, Any] = Field(default_factory=dict)
 
 class ToolExecutionResponse(BaseModel):
+    conversation_id: str
+    tool_name: str
     result: str
 
 # --- Database Model ---
@@ -38,5 +41,5 @@ class ToolCallHistory(SQLModel, table=True):
     conversation_id: str
     timestamp: datetime = SQLField(default_factory=datetime.utcnow)
     tool_name: str
-    request_params: Dict[str, Any] = SQLField(sa_column=Column(JSON))
-    response_content: str
+    parameters: Dict[str, Any] = SQLField(sa_column=Column(JSON))
+    result: str
