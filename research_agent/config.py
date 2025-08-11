@@ -9,5 +9,7 @@ class Settings(BaseSettings):
 
     GITHUB_TOKEN: str = "YOUR_GITHUB_TOKEN_HERE"
     LOCAL_CODEBASE_PATH: str = "."
+    DATABASE_URL: str = "sqlite+aiosqlite:///./research_agent.db"
+    CHROMA_DB_PATH: str = "./chroma_db"
 
 settings = Settings()
